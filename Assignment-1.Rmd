@@ -1,0 +1,472 @@
+---
+title: "Census Income Classification Analysis"
+subtitle: "IN6227-2025-Assignment-1: Decision Tree vs Random Forest Comparison"
+author: "DING HUIYUAN - G2506263F"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center"
+)
+```
+
+# Introduction
+
+This analysis compares Decision Tree and Random Forest algorithms for binary income classification using the Census Income dataset from the UCI Machine Learning Repository. The objective is to predict whether an individual's annual income exceeds $50,000 based on demographic and employment characteristics.
+
+# Setup and Library Loading
+
+```{r libraries}
+# Load required libraries
+library(rpart)          # Decision Tree
+library(randomForest)   # Random Forest
+library(caret)          # Model evaluation and confusion matrix
+library(pROC)           # ROC curves
+library(PRROC)          # Precision-Recall curves
+library(ggplot2)        # Plotting
+library(gridExtra)      # Multiple plots
+library(dplyr)          # Data manipulation
+library(reshape2)       # Data reshaping for plots
+
+# Set seed for reproducibility
+set.seed(123)
+```
+
+# Data Loading and Preprocessing
+
+```{r data-loading}
+# Function to load and preprocess data
+load_and_preprocess_data <- function() {
+  # Define column names based on adult.names file
+  col_names <- c("age", "workclass", "fnlwgt", "education", "education_num",
+                 "marital_status", "occupation", "relationship", "race", "sex",
+                 "capital_gain", "capital_loss", "hours_per_week", "native_country", "income")
+  
+  # Load training data
+  train_data <- read.csv("adult.data", header = FALSE, col.names = col_names, 
+                        stringsAsFactors = FALSE, strip.white = TRUE)
+  
+  # Load test data
+  test_data <- read.csv("adult.test", header = FALSE, col.names = col_names, 
+                       stringsAsFactors = FALSE, strip.white = TRUE, skip = 1)
+  
+  # Clean income column in test data (remove trailing period)
+  test_data$income <- gsub("\\.", "", test_data$income)
+  
+  # Combine datasets for preprocessing
+  train_data$dataset <- "train"
+  test_data$dataset <- "test"
+  combined_data <- rbind(train_data, test_data)
+  
+  # Handle missing values (marked as "?" in the dataset)
+  # Replace "?" with NA
+  combined_data[combined_data == "?"] <- NA
+  
+  # Check missing values
+  cat("Missing values per column:\n")
+  print(colSums(is.na(combined_data)))
+  
+  # Handle missing values by mode imputation for categorical variables
+  # and median imputation for numerical variables
+  for (col in names(combined_data)) {
+    if (is.character(combined_data[[col]])) {
+      # For categorical variables, use mode
+      mode_val <- names(sort(table(combined_data[[col]]), decreasing = TRUE))[1]
+      combined_data[[col]][is.na(combined_data[[col]])] <- mode_val
+    } else if (is.numeric(combined_data[[col]])) {
+      # For numerical variables, use median
+      median_val <- median(combined_data[[col]], na.rm = TRUE)
+      combined_data[[col]][is.na(combined_data[[col]])] <- median_val
+    }
+  }
+  
+  # Convert categorical variables to factors
+  categorical_vars <- c("workclass", "education", "marital_status", "occupation", 
+                       "relationship", "race", "sex", "native_country", "income")
+  combined_data[categorical_vars] <- lapply(combined_data[categorical_vars], as.factor)
+  
+  # Feature engineering: Create age groups
+  combined_data$age_group <- cut(combined_data$age, 
+                                breaks = c(0, 25, 35, 45, 55, 100), 
+                                labels = c("Young", "Young_Adult", "Middle_Age", "Senior", "Elder"))
+  
+  # Create hours per week categories
+  combined_data$hours_category <- cut(combined_data$hours_per_week,
+                                     breaks = c(0, 20, 40, 60, 100),
+                                     labels = c("Part_Time", "Full_Time", "Overtime", "Excessive"))
+  
+  # Split back into train and test
+  train_processed <- combined_data[combined_data$dataset == "train", ]
+  test_processed <- combined_data[combined_data$dataset == "test", ]
+  
+  # Remove dataset column
+  train_processed$dataset <- NULL
+  test_processed$dataset <- NULL
+  
+  # Convert income to binary (0/1) for easier evaluation
+  train_processed$income_binary <- ifelse(train_processed$income == ">50K", 1, 0)
+  test_processed$income_binary <- ifelse(test_processed$income == ">50K", 1, 0)
+  
+  return(list(train = train_processed, test = test_processed))
+}
+
+# Load and preprocess the data
+cat("=== Census Income Classification Analysis ===\n")
+cat("Comparing Decision Tree vs Random Forest\n\n")
+
+cat("Loading and preprocessing data...\n")
+data <- load_and_preprocess_data()
+train_data <- data$train
+test_data <- data$test
+
+cat("Training set size:", nrow(train_data), "\n")
+cat("Test set size:", nrow(test_data), "\n")
+cat("Number of features:", ncol(train_data) - 2, "\n")  # Exclude income and income_binary
+```
+
+# Model Training Functions
+
+## Decision Tree Training
+
+```{r decision-tree-function}
+# Function to train Decision Tree
+train_decision_tree <- function(train_data) {
+  cat("\n=== Training Decision Tree ===\n")
+  
+  # Record training time
+  start_time <- Sys.time()
+  
+  # Train decision tree with cross-validation for complexity parameter
+  dt_model <- rpart(income ~ . - income_binary, 
+                   data = train_data,
+                   method = "class",
+                   control = rpart.control(cp = 0.001, minsplit = 20, minbucket = 7))
+  
+  # Prune the tree using cross-validation
+  cp_optimal <- dt_model$cptable[which.min(dt_model$cptable[,"xerror"]),"CP"]
+  dt_model_pruned <- prune(dt_model, cp = cp_optimal)
+  
+  end_time <- Sys.time()
+  training_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  cat("Decision Tree training completed in", round(training_time, 3), "seconds\n")
+  cat("Optimal CP:", cp_optimal, "\n")
+  
+  return(list(model = dt_model_pruned, training_time = training_time))
+}
+```
+
+## Random Forest Training
+
+```{r random-forest-function}
+# Function to train Random Forest
+train_random_forest <- function(train_data) {
+  cat("\n=== Training Random Forest ===\n")
+  
+  # Record training time
+  start_time <- Sys.time()
+  
+  # Train Random Forest with tuned parameters
+  rf_model <- randomForest(income ~ . - income_binary,
+                          data = train_data,
+                          ntree = 500,
+                          mtry = sqrt(ncol(train_data) - 2),  # Exclude income and income_binary
+                          importance = TRUE,
+                          do.trace = 100)
+  
+  end_time <- Sys.time()
+  training_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  cat("Random Forest training completed in", round(training_time, 3), "seconds\n")
+  cat("Number of trees:", rf_model$ntree, "\n")
+  cat("Variables tried at each split:", rf_model$mtry, "\n")
+  
+  return(list(model = rf_model, training_time = training_time))
+}
+```
+
+# Model Evaluation Function
+
+```{r evaluation-function}
+# Function to evaluate model performance
+evaluate_model <- function(model, test_data, model_name) {
+  cat("\n=== Evaluating", model_name, "===\n")
+  
+  # Record prediction time
+  start_time <- Sys.time()
+  
+  if (model_name == "Decision Tree") {
+    predictions <- predict(model, test_data, type = "class")
+    probabilities <- predict(model, test_data, type = "prob")[, 2]
+  } else {  # Random Forest
+    predictions <- predict(model, test_data)
+    probabilities <- predict(model, test_data, type = "prob")[, 2]
+  }
+  
+  end_time <- Sys.time()
+  prediction_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  # Convert predictions to binary
+  pred_binary <- ifelse(predictions == ">50K", 1, 0)
+  actual_binary <- test_data$income_binary
+  
+  # Calculate confusion matrix
+  cm <- confusionMatrix(as.factor(pred_binary), as.factor(actual_binary), positive = "1")
+  
+  # Calculate metrics
+  accuracy <- cm$overall['Accuracy']
+  precision <- cm$byClass['Precision']
+  recall <- cm$byClass['Recall']
+  f1_score <- cm$byClass['F1']
+  
+  # Calculate AUC
+  roc_obj <- roc(actual_binary, probabilities, quiet = TRUE)
+  auc_score <- auc(roc_obj)
+  
+  # Print results
+  cat("Accuracy:", round(accuracy, 4), "\n")
+  cat("Precision:", round(precision, 4), "\n")
+  cat("Recall:", round(recall, 4), "\n")
+  cat("F1-Score:", round(f1_score, 4), "\n")
+  cat("AUC:", round(auc_score, 4), "\n")
+  cat("Prediction time:", round(prediction_time, 3), "seconds\n")
+  
+  return(list(
+    predictions = pred_binary,
+    probabilities = probabilities,
+    confusion_matrix = cm,
+    metrics = list(
+      accuracy = accuracy,
+      precision = precision,
+      recall = recall,
+      f1_score = f1_score,
+      auc = auc_score
+    ),
+    prediction_time = prediction_time,
+    roc_obj = roc_obj
+  ))
+}
+```
+
+# Visualization Functions
+
+## Confusion Matrix Plots
+
+```{r confusion-matrix-function}
+# Function to create confusion matrix plots
+create_confusion_matrix_plots <- function(dt_results, rf_results) {
+  # Decision Tree Confusion Matrix
+  dt_cm_data <- as.data.frame(dt_results$confusion_matrix$table)
+  dt_cm_plot <- ggplot(dt_cm_data, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = Freq), color = "white", size = 12, fontface = "bold") +
+    scale_fill_gradient(low = "lightblue", high = "darkblue") +
+    labs(title = "Decision Tree - Confusion Matrix",
+         x = "Actual Class (0: ≤50K, 1: >50K)",
+         y = "Predicted Class") +
+    theme_minimal() +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+  
+  # Random Forest Confusion Matrix
+  rf_cm_data <- as.data.frame(rf_results$confusion_matrix$table)
+  rf_cm_plot <- ggplot(rf_cm_data, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = Freq), color = "white", size = 12, fontface = "bold") +
+    scale_fill_gradient(low = "lightcoral", high = "darkred") +
+    labs(title = "Random Forest - Confusion Matrix",
+         x = "Actual Class (0: ≤50K, 1: >50K)",
+         y = "Predicted Class") +
+    theme_minimal() +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+  
+  return(list(dt_cm_plot = dt_cm_plot, rf_cm_plot = rf_cm_plot))
+}
+```
+
+## ROC and PR Curves
+
+```{r comparison-plots-function}
+# Function to create comparison plots
+create_comparison_plots <- function(dt_results, rf_results, test_data) {
+  # ROC Curves
+  roc_plot <- ggplot() +
+    geom_line(aes(x = 1 - dt_results$roc_obj$specificities, 
+                  y = dt_results$roc_obj$sensitivities, 
+                  color = "Decision Tree"), linewidth = 1) +
+    geom_line(aes(x = 1 - rf_results$roc_obj$specificities, 
+                  y = rf_results$roc_obj$sensitivities, 
+                  color = "Random Forest"), linewidth = 1) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+    labs(title = "ROC Curves Comparison",
+         x = "False Positive Rate",
+         y = "True Positive Rate") +
+    scale_color_manual(values = c("Decision Tree" = "blue", "Random Forest" = "red")) +
+    theme_minimal() +
+    theme(legend.title = element_blank())
+  
+  # Precision-Recall Curves
+  dt_pr <- pr.curve(scores.class0 = dt_results$probabilities[test_data$income_binary == 1],
+                    scores.class1 = dt_results$probabilities[test_data$income_binary == 0],
+                    curve = TRUE)
+  
+  rf_pr <- pr.curve(scores.class0 = rf_results$probabilities[test_data$income_binary == 1],
+                    scores.class1 = rf_results$probabilities[test_data$income_binary == 0],
+                    curve = TRUE)
+  
+  pr_plot <- ggplot() +
+    geom_line(aes(x = dt_pr$curve[, 1], y = dt_pr$curve[, 2], color = "Decision Tree"), linewidth = 1) +
+    geom_line(aes(x = rf_pr$curve[, 1], y = rf_pr$curve[, 2], color = "Random Forest"), linewidth = 1) +
+    labs(title = "Precision-Recall Curves Comparison",
+         x = "Recall",
+         y = "Precision") +
+    scale_color_manual(values = c("Decision Tree" = "blue", "Random Forest" = "red")) +
+    theme_minimal() +
+    theme(legend.title = element_blank())
+  
+  # Performance metrics comparison
+  metrics_df <- data.frame(
+    Model = c("Decision Tree", "Random Forest"),
+    Accuracy = c(dt_results$metrics$accuracy, rf_results$metrics$accuracy),
+    Precision = c(dt_results$metrics$precision, rf_results$metrics$precision),
+    Recall = c(dt_results$metrics$recall, rf_results$metrics$recall),
+    F1_Score = c(dt_results$metrics$f1_score, rf_results$metrics$f1_score),
+    AUC = c(dt_results$metrics$auc, rf_results$metrics$auc)
+  )
+  
+  # Reshape for plotting
+  metrics_long <- reshape2::melt(metrics_df, id.vars = "Model")
+  
+  metrics_plot <- ggplot(metrics_long, aes(x = variable, y = value, fill = Model)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = "Performance Metrics Comparison",
+         x = "Metrics",
+         y = "Score") +
+    scale_fill_manual(values = c("Decision Tree" = "lightblue", "Random Forest" = "lightcoral")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  return(list(roc_plot = roc_plot, pr_plot = pr_plot, metrics_plot = metrics_plot, 
+              metrics_df = metrics_df))
+}
+```
+
+# Model Training and Evaluation
+
+```{r model-training}
+# Train models
+dt_result <- train_decision_tree(train_data)
+rf_result <- train_random_forest(train_data)
+
+# Evaluate models
+dt_evaluation <- evaluate_model(dt_result$model, test_data, "Decision Tree")
+rf_evaluation <- evaluate_model(rf_result$model, test_data, "Random Forest")
+```
+
+# Results Visualization
+
+## Confusion Matrices
+
+```{r confusion-matrices, fig.height=8}
+# Create confusion matrix plots
+cm_plots <- create_confusion_matrix_plots(dt_evaluation, rf_evaluation)
+
+# Display confusion matrices
+grid.arrange(cm_plots$dt_cm_plot, cm_plots$rf_cm_plot, ncol = 2)
+```
+
+## ROC and Precision-Recall Curves
+
+```{r roc-pr-curves, fig.height=8}
+# Create comparison plots
+plots <- create_comparison_plots(dt_evaluation, rf_evaluation, test_data)
+
+# Display ROC and PR curves
+grid.arrange(plots$roc_plot, plots$pr_plot, ncol = 2)
+```
+
+## Performance Metrics Comparison
+
+```{r metrics-comparison}
+# Display performance metrics plot
+print(plots$metrics_plot)
+```
+
+# Summary Results
+
+## Performance Comparison Table
+
+```{r results-table}
+# Create comprehensive results table
+results_table <- data.frame(
+  Model = c("Decision Tree", "Random Forest"),
+  Accuracy = c(dt_evaluation$metrics$accuracy, rf_evaluation$metrics$accuracy),
+  Precision = c(dt_evaluation$metrics$precision, rf_evaluation$metrics$precision),
+  Recall = c(dt_evaluation$metrics$recall, rf_evaluation$metrics$recall),
+  F1_Score = c(dt_evaluation$metrics$f1_score, rf_evaluation$metrics$f1_score),
+  AUC = c(dt_evaluation$metrics$auc, rf_evaluation$metrics$auc),
+  Training_Time_sec = c(dt_result$training_time, rf_result$training_time),
+  Prediction_Time_sec = c(dt_evaluation$prediction_time, rf_evaluation$prediction_time)
+)
+
+# Round numeric columns for better display
+results_table[, 2:8] <- round(results_table[, 2:8], 4)
+
+# Display the table
+knitr::kable(results_table, 
+             caption = "Comprehensive Model Performance Comparison",
+             col.names = c("Model", "Accuracy", "Precision", "Recall", "F1-Score", "AUC", "Training Time (s)", "Prediction Time (s)"))
+```
+
+## Summary Statistics
+
+```{r summary-stats}
+cat("\n=== SUMMARY COMPARISON ===\n")
+print(plots$metrics_df)
+
+cat("\nTraining Times:\n")
+cat("Decision Tree:", round(dt_result$training_time, 3), "seconds\n")
+cat("Random Forest:", round(rf_result$training_time, 3), "seconds\n")
+
+cat("\nPrediction Times:\n")
+cat("Decision Tree:", round(dt_evaluation$prediction_time, 3), "seconds\n")
+cat("Random Forest:", round(rf_evaluation$prediction_time, 3), "seconds\n")
+
+# Determine better model
+if (rf_evaluation$metrics$auc > dt_evaluation$metrics$auc) {
+  cat("\nCONCLUSION: Random Forest performed better with higher AUC (", 
+      round(rf_evaluation$metrics$auc, 4), " vs ", 
+      round(dt_evaluation$metrics$auc, 4), ")\n")
+} else {
+  cat("\nCONCLUSION: Decision Tree performed better with higher AUC\n")
+}
+```
+
+# Conclusion
+
+Based on the comprehensive analysis:
+
+- **Decision Tree** achieved higher accuracy (`r round(dt_evaluation$metrics$accuracy, 4)`) and precision (`r round(dt_evaluation$metrics$precision, 4)`)
+- **Random Forest** demonstrated superior AUC (`r round(rf_evaluation$metrics$auc, 4)` vs `r round(dt_evaluation$metrics$auc, 4)`), recall (`r round(rf_evaluation$metrics$recall, 4)`), and F1-score (`r round(rf_evaluation$metrics$f1_score, 4)`)
+- **Computational Efficiency**: Decision Tree was significantly faster in both training (`r round(dt_result$training_time, 2)`s vs `r round(rf_result$training_time, 2)`s) and prediction (`r round(dt_evaluation$prediction_time, 3)`s vs `r round(rf_evaluation$prediction_time, 3)`s)
+
+**Recommendation**: Random Forest is preferred for applications prioritizing predictive accuracy and robustness, while Decision Tree is optimal for scenarios requiring fast inference and interpretability.
+
+---
+
+*Analysis completed on `r Sys.Date()`*
